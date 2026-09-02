@@ -511,16 +511,33 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
   })
 
   it("buildRequestHeaders defaults to the captured Claude CLI version", () => {
-    const headers = helpers.buildRequestHeaders(
-      "https://api.anthropic.com/v1/messages",
-      { headers: {} },
-      "token",
-      "claude-fable-5-1",
-    )
-    assert.equal(
-      headers.get("user-agent"),
-      "claude-cli/2.1.258 (external, sdk-cli)",
-    )
+    const previousCliVersion = process.env.ANTHROPIC_CLI_VERSION
+    const previousUserAgent = process.env.ANTHROPIC_USER_AGENT
+    delete process.env.ANTHROPIC_CLI_VERSION
+    delete process.env.ANTHROPIC_USER_AGENT
+    try {
+      const headers = helpers.buildRequestHeaders(
+        "https://api.anthropic.com/v1/messages",
+        { headers: {} },
+        "token",
+        "claude-fable-5-1",
+      )
+      assert.equal(
+        headers.get("user-agent"),
+        "claude-cli/2.1.258 (external, sdk-cli)",
+      )
+    } finally {
+      if (previousCliVersion === undefined) {
+        delete process.env.ANTHROPIC_CLI_VERSION
+      } else {
+        process.env.ANTHROPIC_CLI_VERSION = previousCliVersion
+      }
+      if (previousUserAgent === undefined) {
+        delete process.env.ANTHROPIC_USER_AGENT
+      } else {
+        process.env.ANTHROPIC_USER_AGENT = previousUserAgent
+      }
+    }
   })
 
   it("buildRequestHeaders uses ANTHROPIC_USER_AGENT when set", () => {

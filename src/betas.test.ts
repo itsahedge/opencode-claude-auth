@@ -61,13 +61,11 @@ describe("betas", () => {
     }
   })
 
-  it("effort beta: sonnet-4-6 omits it, opus-4-6/4-7 add it, opus-4-5 unaffected", () => {
-    // Pins the first-match-wins override ordering: "claude-sonnet-4-6"
-    // matches the "sonnet" key before "4-6", so it must NOT get the effort
-    // beta, while opus-4-6/4-7 reach their "4-6"/"4-7" add-overrides.
+  it("matches Claude Code 2.1.258 effort beta selection", () => {
+    // Specific model/version keys must win before broad family exclusions.
     assert.ok(
-      !getModelBetas("claude-sonnet-4-6").includes("effort-2025-11-24"),
-      "sonnet-4-6 must not include effort",
+      getModelBetas("claude-sonnet-4-6").includes("effort-2025-11-24"),
+      "sonnet-4-6 must include effort",
     )
     assert.ok(
       getModelBetas("claude-opus-4-6").includes("effort-2025-11-24"),
@@ -78,9 +76,39 @@ describe("betas", () => {
       "opus-4-7 must include effort",
     )
     assert.ok(
-      !getModelBetas("claude-opus-4-5").includes("effort-2025-11-24"),
-      "opus-4-5 must not include effort",
+      getModelBetas("claude-opus-4-5").includes("effort-2025-11-24"),
+      "opus-4-5 must include effort",
     )
+    assert.ok(
+      !getModelBetas("claude-sonnet-4-5").includes("effort-2025-11-24"),
+      "sonnet-4-5 must not include effort",
+    )
+  })
+
+  it("matches Claude Code 2.1.258 feature betas for Fable and Opus 4.8", () => {
+    const fableOnly = "fallback-credit-2026-06-01"
+    const adaptiveModelBetas = [
+      "mid-conversation-system-2026-04-07",
+      "effort-2025-11-24",
+    ]
+
+    for (const model of ["claude-fable-5", "claude-fable-5-1"]) {
+      const betas = getModelBetas(model)
+      for (const beta of [...adaptiveModelBetas, fableOnly]) {
+        assert.ok(betas.includes(beta), `${model} should include ${beta}`)
+      }
+    }
+
+    for (const model of ["claude-opus-4-8", "claude-opus-4-8-fast"]) {
+      const betas = getModelBetas(model)
+      for (const beta of adaptiveModelBetas) {
+        assert.ok(betas.includes(beta), `${model} should include ${beta}`)
+      }
+      assert.ok(
+        !betas.includes(fableOnly),
+        `${model} must not include ${fableOnly}`,
+      )
+    }
   })
 
   it("getModelOverride sets disableEffort for haiku models", () => {

@@ -12,7 +12,7 @@ export interface ModelConfig {
 }
 
 export const config: ModelConfig = {
-  ccVersion: "2.1.217",
+  ccVersion: "2.1.258",
   baseBetas: [
     "claude-code-20250219",
     "oauth-2025-04-20",
@@ -27,12 +27,25 @@ export const config: ModelConfig = {
     "context-1m-2025-08-07",
     "interleaved-thinking-2025-05-14",
   ],
-  // NOTE: getModelOverride is first-match-wins. The "sonnet" key must stay
-  // ahead of "4-6"/"4-7": it shields claude-sonnet-4-6 from the "4-6"
-  // effort add-override, and its exclude strips effort if a user supplies
-  // it via ANTHROPIC_BETA_FLAGS. Do not remove it as inert — the split is
-  // pinned by the "effort beta" test in betas.test.ts.
+  // NOTE: getModelOverride is first-match-wins. Specific model/version keys
+  // must stay ahead of broad family keys such as "sonnet".
   modelOverrides: {
+    fable: {
+      add: [
+        "mid-conversation-system-2026-04-07",
+        "effort-2025-11-24",
+        "fallback-credit-2026-06-01",
+      ],
+    },
+    "opus-4-8": {
+      add: ["mid-conversation-system-2026-04-07", "effort-2025-11-24"],
+    },
+    "sonnet-4-6": {
+      add: ["effort-2025-11-24"],
+    },
+    "opus-4-5": {
+      add: ["effort-2025-11-24"],
+    },
     sonnet: {
       exclude: ["effort-2025-11-24"],
     },

@@ -510,6 +510,19 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     }
   })
 
+  it("buildRequestHeaders defaults to the captured Claude CLI version", () => {
+    const headers = helpers.buildRequestHeaders(
+      "https://api.anthropic.com/v1/messages",
+      { headers: {} },
+      "token",
+      "claude-fable-5-1",
+    )
+    assert.equal(
+      headers.get("user-agent"),
+      "claude-cli/2.1.258 (external, sdk-cli)",
+    )
+  })
+
   it("buildRequestHeaders uses ANTHROPIC_USER_AGENT when set", () => {
     process.env.ANTHROPIC_USER_AGENT = "custom-agent/1.0"
     try {

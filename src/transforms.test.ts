@@ -129,6 +129,7 @@ describe("transforms", () => {
     }
 
     assert.ok(parsed.system[0].text.startsWith("x-anthropic-billing-header:"))
+    assert.ok(parsed.system[0].text.includes("cc_version=2.1.258."))
     assert.ok(
       parsed.system[0].text.includes("cch=fa690"),
       `Expected cch=fa690 for 'hey', got: ${parsed.system[0].text}`,

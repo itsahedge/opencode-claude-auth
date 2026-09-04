@@ -9,7 +9,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { acquireRefreshLock } from "./refresh-lock.ts"
+import { acquireRefreshLock, DEFAULT_LOCK_TTL_MS } from "./refresh-lock.ts"
 
 const SRC = "Claude Code-credentials"
 
@@ -20,6 +20,10 @@ describe("refresh-lock", () => {
   })
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true })
+  })
+
+  it("keeps the lock through the maximum CLI fallback duration", () => {
+    assert.ok(DEFAULT_LOCK_TTL_MS >= 135_000)
   })
 
   it("grants the lock to the first caller and denies a second holder", () => {

@@ -23,6 +23,17 @@ import {
   writeBackCredentials,
 } from "./keychain.ts"
 
+function keychainCredentialBlob(accessToken: string): string {
+  return JSON.stringify({
+    claudeAiOauth: {
+      accessToken,
+      refreshToken: `rt-for-${accessToken}`,
+      expiresAt: 1000,
+      subscriptionType: "max",
+    },
+  })
+}
+
 // Mirrors listClaudeKeychainServices regex logic for unit testing
 type MockedKeychain = {
   readAllClaudeAccounts: () => Array<{
@@ -319,6 +330,108 @@ describe("account labelling", () => {
 })
 
 describe("readAllClaudeAccounts", () => {
+  it("includes the file store as its own account alongside keychain entries", async () => {
+    const originalHome = process.env.HOME
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    const primaryDir = join(tempHome, ".claude")
+    mkdirSync(primaryDir, { recursive: true })
+    writeFileSync(
+      join(primaryDir, ".claude.json"),
+      JSON.stringify({ oauthAccount: { emailAddress: "file@example.com" } }),
+    )
+    writeFileSync(
+      join(primaryDir, ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "file-at",
+          refreshToken: "file-rt",
+          expiresAt: 1_700_000_000_002,
+          subscriptionType: "pro",
+        },
+      }),
+    )
+
+    process.env.HOME = tempHome
+
+    try {
+      const { readAllClaudeAccounts } = await loadKeychainWithMockedSecurity(
+        `"svce"<blob>="Claude Code-credentials-9129e099"`,
+        {
+          "Claude Code-credentials-9129e099": JSON.stringify({
+            claudeAiOauth: {
+              accessToken: "stale-at",
+              refreshToken: "stale-rt",
+              expiresAt: 1_700_000_000_000,
+              subscriptionType: "pro",
+            },
+          }),
+        },
+      )
+
+      const accounts = readAllClaudeAccounts()
+      assert.equal(accounts.length, 2)
+      assert.equal(accounts[0].source, "Claude Code-credentials-9129e099")
+      assert.equal(accounts[1].source, "file")
+      assert.equal(accounts[1].credentials.accessToken, "file-at")
+      assert.equal(accounts[1].configDir, primaryDir)
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = originalHome
+      }
+      rmSync(tempHome, { recursive: true, force: true })
+    }
+  })
+
+  it("does not duplicate a keychain account whose token matches the file store", async () => {
+    const originalHome = process.env.HOME
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    const primaryDir = join(tempHome, ".claude")
+    mkdirSync(primaryDir, { recursive: true })
+    writeFileSync(join(primaryDir, ".claude.json"), JSON.stringify({}))
+    writeFileSync(
+      join(primaryDir, ".credentials.json"),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "same-at",
+          refreshToken: "same-rt",
+          expiresAt: 1_700_000_000_000,
+          subscriptionType: "pro",
+        },
+      }),
+    )
+
+    process.env.HOME = tempHome
+
+    try {
+      const { readAllClaudeAccounts } = await loadKeychainWithMockedSecurity(
+        `"svce"<blob>="Claude Code-credentials"`,
+        {
+          "Claude Code-credentials": JSON.stringify({
+            claudeAiOauth: {
+              accessToken: "same-at",
+              refreshToken: "same-rt",
+              expiresAt: 1_700_000_000_000,
+              subscriptionType: "pro",
+            },
+          }),
+        },
+      )
+
+      const accounts = readAllClaudeAccounts()
+      assert.equal(accounts.length, 1)
+      assert.equal(accounts[0].source, "Claude Code-credentials")
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.HOME
+      } else {
+        process.env.HOME = originalHome
+      }
+      rmSync(tempHome, { recursive: true, force: true })
+    }
+  })
+
   it("resolves suffixed keychain services back to config dirs and emails", async () => {
     const originalHome = process.env.HOME
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
@@ -937,16 +1050,6 @@ describe("writeBackCredentials (keychain source)", () => {
   const SERVICE = "Claude Code-credentials"
   const DUMP = `"${SERVICE}"`
 
-  const blob = (accessToken: string) =>
-    JSON.stringify({
-      claudeAiOauth: {
-        accessToken,
-        refreshToken: `rt-for-${accessToken}`,
-        expiresAt: 1000,
-        subscriptionType: "max",
-      },
-    })
-
   const refreshed = {
     accessToken: "our-refreshed-at",
     refreshToken: "our-refreshed-rt",
@@ -954,18 +1057,13 @@ describe("writeBackCredentials (keychain source)", () => {
   }
 
   it("skips the write when the stored token is no longer the expected one", async () => {
-    const { writeBackCredentials, __getSecurityWrites } =
+    const { writeBackCredentials: writeBackToMock, __getSecurityWrites } =
       await loadKeychainWithMockedSecurity(DUMP, {
         // Another account was switched in after we read "expected-at".
-        [SERVICE]: blob("switched-in-at"),
+        [SERVICE]: keychainCredentialBlob("switched-in-at"),
       })
 
-    const result = writeBackCredentials(
-      SERVICE,
-      refreshed,
-      undefined,
-      "expected-at",
-    )
+    const result = writeBackToMock(SERVICE, refreshed, undefined, "expected-at")
 
     assert.equal(result, false)
     assert.deepEqual(
@@ -976,17 +1074,12 @@ describe("writeBackCredentials (keychain source)", () => {
   })
 
   it("writes when the stored token still matches the expected one", async () => {
-    const { writeBackCredentials, __getSecurityWrites } =
+    const { writeBackCredentials: writeBackToMock, __getSecurityWrites } =
       await loadKeychainWithMockedSecurity(DUMP, {
-        [SERVICE]: blob("expected-at"),
+        [SERVICE]: keychainCredentialBlob("expected-at"),
       })
 
-    const result = writeBackCredentials(
-      SERVICE,
-      refreshed,
-      undefined,
-      "expected-at",
-    )
+    const result = writeBackToMock(SERVICE, refreshed, undefined, "expected-at")
 
     assert.equal(result, true)
     const writes = __getSecurityWrites()
@@ -1004,12 +1097,12 @@ describe("writeBackCredentials (keychain source)", () => {
   })
 
   it("writes without a guard when no expected token is supplied", async () => {
-    const { writeBackCredentials, __getSecurityWrites } =
+    const { writeBackCredentials: writeBackToMock, __getSecurityWrites } =
       await loadKeychainWithMockedSecurity(DUMP, {
-        [SERVICE]: blob("whatever-is-there"),
+        [SERVICE]: keychainCredentialBlob("whatever-is-there"),
       })
 
-    assert.equal(writeBackCredentials(SERVICE, refreshed), true)
+    assert.equal(writeBackToMock(SERVICE, refreshed), true)
     assert.equal(__getSecurityWrites().length, 1)
   })
 })

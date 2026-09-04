@@ -93,6 +93,7 @@ async function loadCredentialsWithCountingKeychain(
   childProcessModule: {
     __getExecFileSyncCount: () => number
     __getExecSyncCount: () => number
+    __setExecSyncHook: (hook: (() => void) | null) => void
   }
   loggerModule: {
     __getLogs: () => Array<{ event: string; data?: unknown }>
@@ -151,6 +152,7 @@ export function closeLogger() {}
     tempChildProcess,
     `let execFileSyncCount = 0
 let execSyncCount = 0
+let execSyncHook = null
 
 export function execFileSync() {
   execFileSyncCount += 1
@@ -159,6 +161,7 @@ export function execFileSync() {
 
 export function execSync() {
   execSyncCount += 1
+  if (execSyncHook) execSyncHook()
   return ""
 }
 
@@ -168,6 +171,10 @@ export function __getExecFileSyncCount() {
 
 export function __getExecSyncCount() {
   return execSyncCount
+}
+
+export function __setExecSyncHook(hook) {
+  execSyncHook = hook
 }
 `,
     "utf8",
@@ -314,6 +321,7 @@ export function __setAccounts(list) {
     childProcessModule: childProcessModule as {
       __getExecFileSyncCount: () => number
       __getExecSyncCount: () => number
+      __setExecSyncHook: (hook: (() => void) | null) => void
     },
     loggerModule: loggerModule as {
       __getLogs: () => Array<{ event: string; data?: unknown }>
@@ -1722,35 +1730,21 @@ describe("refreshViaOAuth", () => {
     }
   })
 
-  // The token endpoint rate-limits valid refresh requests readily, and
-  // several OpenCode instances refreshing near expiry cluster their calls.
-  // The API request path already retries 429; this one did not.
-  it("retries a rate-limited refresh instead of failing outright", async () => {
+  it("does not retry a rate-limited token refresh", async () => {
     const originalFetch = globalThis.fetch
     let calls = 0
 
     globalThis.fetch = (async () => {
       calls += 1
-      if (calls === 1) {
-        return new Response(JSON.stringify({ error: "rate_limited" }), {
-          status: 429,
-          headers: { "retry-after": "0" },
-        })
-      }
-      return new Response(
-        JSON.stringify({
-          access_token: "sk-ant-oat01-after-retry",
-          expires_in: 28_800,
-        }),
-        { status: 200 },
-      )
+      return new Response(JSON.stringify({ error: "rate_limited" }), {
+        status: 429,
+      })
     }) as typeof fetch
 
     try {
       const result = await refreshViaOAuth("sk-ant-ort01-current")
-      assert.ok(result, "expected the retry to produce credentials")
-      assert.equal(result.accessToken, "sk-ant-oat01-after-retry")
-      assert.equal(calls, 2, "expected exactly one retry")
+      assert.equal(result, null)
+      assert.equal(calls, 1, "outer refresh coordination owns retries")
     } finally {
       globalThis.fetch = originalFetch
     }
@@ -1888,6 +1882,55 @@ function makeAccount(expiresAt: number) {
 }
 
 describe("refreshIfNeeded CLI fallback scope", () => {
+  it("uses the CLI near expiry when direct OAuth refresh is rate-limited", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            type: "rate_limit_error",
+            message: "Rate limited. Please try again later.",
+          },
+        }),
+        { status: 429, headers: { "retry-after": "3600" } },
+      )) as typeof fetch
+
+    try {
+      const { credentialsModule, keychainModule, childProcessModule } =
+        await loadCredentialsWithCountingKeychain(now + 30_000)
+      const target = {
+        ...makeAccount(now + 30_000),
+        source: "file",
+        configDir: "/tmp/claude-auth-test",
+      }
+      credentialsModule.initAccounts([target])
+      keychainModule.__setCredentialsForSource("file", target.credentials)
+      childProcessModule.__setExecSyncHook(() => {
+        keychainModule.__setCredentialsForSource("file", {
+          accessToken: "cli-refreshed-token",
+          refreshToken: "cli-refreshed-refresh",
+          expiresAt: now + 8 * 60 * 60_000,
+        })
+      })
+
+      const result = await credentialsModule.refreshIfNeeded(target)
+
+      assert.equal(
+        childProcessModule.__getExecSyncCount(),
+        1,
+        "the Claude CLI should recover when the plugin OAuth client is blocked",
+      )
+      assert.equal(result?.accessToken, "cli-refreshed-token")
+      assert.equal(credentialsModule.getActiveRefreshFailureKind(), null)
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
   it("refreshes via OAuth without spawning the claude CLI", async () => {
     const originalFetch = globalThis.fetch
     const originalNow = Date.now
@@ -1924,9 +1967,8 @@ describe("refreshIfNeeded CLI fallback scope", () => {
     }
   })
 
-  // Regression for the proactive-refresh window (1h). The claude CLI only
-  // rotates a token that is close to expiry, so invoking it an hour early
-  // burns a real API call every sync tick and returns the same token.
+  // The claude CLI only rotates a token that is close to expiry, so invoking
+  // it an hour early burns a real API call and returns the same token.
   it("does not spawn the claude CLI while credentials are still usable", async () => {
     const originalFetch = globalThis.fetch
     const originalNow = Date.now
@@ -1972,10 +2014,8 @@ describe("refreshIfNeeded CLI fallback scope", () => {
     }
   })
 
-  // The proactive sync timer calls refreshIfNeeded() directly while the
-  // request path reaches it through getCachedCredentials(). A rotation
-  // invalidates the refresh token it was issued against, so two concurrent
-  // refreshes would leave one caller holding a token that is already dead.
+  // A rotation invalidates the refresh token it was issued against, so two
+  // concurrent refreshes would leave one caller holding a dead token.
   it("collapses concurrent refreshes of one account into a single OAuth call", async () => {
     const originalFetch = globalThis.fetch
     const originalNow = Date.now
@@ -2993,6 +3033,46 @@ describe("getCredentialsWithBackoff (transient rate-limit resilience)", () => {
 })
 
 describe("cross-process refresh lock (single-flight)", () => {
+  it("reports lock contention as transient while another process refreshes", async () => {
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    let clock = now
+    Date.now = () => clock
+
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now - 1_000)
+      const target = makeAccount(now - 1_000)
+      credentialsModule.initAccounts([target])
+      keychainModule.__setCredentialsForSource("keychain", target.credentials)
+      keychainModule.__setReadHook(() => {
+        clock += 1_000
+      })
+
+      const held = acquireRefreshLock(target.source)
+      assert.ok(held)
+      try {
+        assert.equal(await credentialsModule.refreshIfNeeded(target), null)
+        assert.equal(
+          credentialsModule.getActiveRefreshFailureKind(),
+          "transient",
+        )
+
+        const concurrentWaiter = credentialsModule.refreshIfNeeded(target)
+        assert.equal(
+          credentialsModule.getActiveRefreshFailureKind(),
+          "transient",
+          "a concurrent waiter must not clear the retryable state",
+        )
+        assert.equal(await concurrentWaiter, null)
+      } finally {
+        held!.release()
+      }
+    } finally {
+      Date.now = originalNow
+    }
+  })
+
   it("waits for and adopts a sibling's token while another process holds the lock", async () => {
     const originalNow = Date.now
     const originalFetch = globalThis.fetch

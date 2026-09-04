@@ -30,7 +30,8 @@ import { log } from "./logger.ts"
 export const DEFAULT_LOCK_TTL_MS = (() => {
   const raw = process.env.OPENCODE_CLAUDE_AUTH_REFRESH_LOCK_TTL_MS
   const parsed = raw ? Number.parseInt(raw, 10) : NaN
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 20_000
+  // OAuth can consume 15s before the CLI fallback makes two 60s attempts.
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 150_000
 })()
 
 export interface RefreshLock {

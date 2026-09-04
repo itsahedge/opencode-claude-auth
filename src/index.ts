@@ -24,13 +24,13 @@ import {
   reloadCredentialsFromSource,
   forceRefreshActiveAccount,
   getActiveAccount,
+  getCredentialsForSync,
   syncAuthJson,
   initAccounts,
   setActiveAccountSource,
   loadPersistedAccountSource,
   saveAccountSource,
   refreshAccountsList,
-  refreshIfNeeded,
   type ClaudeCredentials,
 } from "./credentials.ts"
 
@@ -169,7 +169,6 @@ export function buildRequestHeaders(
 }
 
 const SYNC_INTERVAL = 5 * 60 * 1000 // 5 minutes
-const PROACTIVE_REFRESH_THRESHOLD_MS = 60 * 60 * 1000 // 1 hour before expiry
 
 const plugin: Plugin = async () => {
   initLogger()
@@ -214,46 +213,13 @@ const plugin: Plugin = async () => {
       )
     }
 
-    // Keep auth.json synced and proactively refresh before expiry.
-    // refreshIfNeeded() always resolves the currently ACTIVE account
-    // (via getActiveAccount() internally) — not a closure-captured account
-    // list — so this stays correct across account switches. Passing
-    // PROACTIVE_REFRESH_THRESHOLD_MS (1 hour) means it triggers a real
-    // OAuth refresh once the token is within that window of expiry, and
-    // simply returns the untouched credentials otherwise (no-op refresh).
-    // This prevents the "run `claude` to re-authenticate" message from
-    // appearing mid-session when the token silently expires.
-    let proactiveRefreshWarned = false
-    const syncTimer = setInterval(async () => {
+    // Idle OpenCode processes only mirror credentials. Request-time refresh
+    // owns rotation so one active process, guarded by the shared lock, contacts
+    // the token endpoint instead of every five-minute timer doing so.
+    const syncTimer = setInterval(() => {
       try {
-        const account = getActiveAccount()
-        log("proactive_refresh_check", {
-          source: account?.source ?? null,
-          expiresAt: account?.credentials?.expiresAt ?? null,
-          thresholdMs: PROACTIVE_REFRESH_THRESHOLD_MS,
-        })
-
-        const creds = await refreshIfNeeded(
-          undefined,
-          PROACTIVE_REFRESH_THRESHOLD_MS,
-        )
-        if (creds) {
-          syncAuthJson(creds)
-          if (proactiveRefreshWarned) {
-            log("proactive_refresh_recovered", { source: account?.source })
-          }
-          proactiveRefreshWarned = false
-        } else {
-          log("proactive_refresh_failed", { source: account?.source })
-          // Only warn once per outage — otherwise this fires every
-          // SYNC_INTERVAL (5 min) for as long as refresh keeps failing.
-          if (!proactiveRefreshWarned) {
-            proactiveRefreshWarned = true
-            console.warn(
-              "opencode-claude-auth: Proactive token refresh failed. Run `claude` to re-authenticate.",
-            )
-          }
-        }
+        const creds = getCredentialsForSync()
+        if (creds) syncAuthJson(creds)
       } catch {
         // Non-fatal
       }
@@ -318,6 +284,34 @@ const plugin: Plugin = async () => {
               latest = await getCredentialsWithBackoff({
                 signal: requestInit.signal ?? undefined,
               })
+            }
+            if (!latest && !getActiveAccount()) {
+              // Claude Code is the preferred credential source, but OpenCode
+              // may still hold a valid OAuth credential when the Keychain or
+              // credentials file is temporarily unavailable. Re-read it for
+              // each request so a token rotated by OpenCode is not captured
+              // stale when the loader first starts.
+              try {
+                const openCodeAuth = await getAuth()
+                if (
+                  openCodeAuth.type === "oauth" &&
+                  openCodeAuth.access.length > 0 &&
+                  openCodeAuth.expires > Date.now() + 60_000
+                ) {
+                  latest = {
+                    accessToken: openCodeAuth.access,
+                    refreshToken: openCodeAuth.refresh,
+                    expiresAt: openCodeAuth.expires,
+                  }
+                  log("fetch_credentials_opencode_oauth", {
+                    expiresAt: openCodeAuth.expires,
+                  })
+                }
+              } catch (err) {
+                log("fetch_opencode_auth_reload_failed", {
+                  error: err instanceof Error ? err.message : String(err),
+                })
+              }
             }
             if (!latest) {
               if (getActiveRefreshFailureKind() === "transient") {

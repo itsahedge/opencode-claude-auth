@@ -258,16 +258,34 @@ export function __setCredentials(c) {
   }
 }
 
+async function loadHelpersWithEmptyKeychain(): Promise<{
+  helpersModule: typeof import("./index.ts")
+}> {
+  const tempDir = await mkdtemp(
+    join(tmpdir(), "opencode-claude-auth-empty-keychain-"),
+  )
+
+  await copySourceFiles(tempDir)
+  await writeFile(
+    join(tempDir, "keychain.ts"),
+    `export const PRIMARY_SERVICE = "Claude Code-credentials"
+export function readAllClaudeAccounts() { return [] }
+export function refreshAccount() { return null }
+export function writeBackCredentials() { return false }
+export function buildAccountLabels() { return [] }
+`,
+    "utf8",
+  )
+
+  const helpersModule = await import(
+    pathToFileURL(join(tempDir, "index.ts")).href
+  )
+  return { helpersModule }
+}
+
 /**
- * Fake keychain with TWO accounts, used to regression-test the proactive
- * refresh timer's account resolution (bug: it used to read the closure-
- * captured `accounts[0]` instead of the currently active account after a
- * switch). Both accounts get `refreshToken: ""` so `refreshViaOAuth()`'s
- * `if (creds.refreshToken)` guard skips it entirely — no real network call
- * — and the refresh cascade falls straight through to the CLI fallback
- * (which fails fast with ENOENT since `claude` isn't installed in test
- * envs) and finally to the mocked `refreshAccount(source)`, which is what
- * actually determines success/failure here.
+ * Fake keychain with two accounts for sync-timer account selection tests.
+ * Empty refresh tokens keep tests off the network.
  */
 async function loadHelpersWithMultiAccountKeychain(opts: {
   aExpiresAt: number
@@ -936,16 +954,13 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     }
   })
 
-  it("proactive refresh timer targets the ACTIVE account after a switch, not accounts[0]", async () => {
+  it("sync timer does not refresh expiring credentials", async () => {
     const originalSetInterval = globalThis.setInterval
     const originalHome = process.env.HOME
     const originalDebug = process.env.CLAUDE_AUTH_DEBUG
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
     const debugLogPath = join(tempHome, "debug.log")
     process.env.HOME = tempHome
-    // Capture the timer's own log ("proactive_refresh_check") so we can
-    // assert which account it resolved to. The CLAUDE_AUTH_DEBUG env
-    // routes logs to a file (see logger.ts).
     process.env.CLAUDE_AUTH_DEBUG = debugLogPath
 
     let tickCallback: (() => void | Promise<void>) | undefined
@@ -956,16 +971,9 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
 
     try {
       const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
-        // accounts[0] ("acct-a") — far from expiry. The pre-fix code used
-        // THIS account's expiry to decide whether to take the proactive
-        // branch at all, regardless of which account is actually active.
         aExpiresAt: Date.now() + 10 * 60 * 60 * 1000,
-        // Active account after the switch below — within the 1h proactive
-        // window but past the 60s reactive threshold, so authorize()'s own
-        // getCachedCredentials() call must NOT refresh it (isolating the
-        // timer as the only thing that triggers a refresh here).
         bExpiresAt: Date.now() + 10 * 60 * 1000,
-        bRefreshResult: "success",
+        bRefreshResult: "fail",
       })
 
       const plugin = await helpersModule.default({} as never)
@@ -983,35 +991,11 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
       }
       await typedPlugin.auth!.methods![0]!.authorize!({ account: "acct-b" })
 
-      // Truncate the log so we only inspect entries produced by the tick.
       await writeFile(debugLogPath, "", "utf-8")
-
-      // Fire the timer tick manually — this is the only thing that should
-      // trigger a refresh in this scenario.
       await tickCallback!()
 
       const logs = await readFile(debugLogPath, "utf-8")
-      // The fix: timer's proactive_refresh_check should reference the
-      // ACTIVE account (acct-b), not the closure-captured accounts[0]
-      // (acct-a). With the accounts[0] bug, the log would show
-      // "source":"acct-a" here.
-      const proactiveCheckEntries = logs
-        .split("\n")
-        .filter((line) => line.includes("proactive_refresh_check"))
-      assert.ok(
-        proactiveCheckEntries.length > 0,
-        `Expected proactive_refresh_check log entry, got log: ${logs}`,
-      )
-      assert.ok(
-        proactiveCheckEntries.some((l) => l.includes('"source":"acct-b"')),
-        `Timer should resolve ACTIVE account (acct-b) after switch, not ` +
-          `accounts[0] (acct-a). Log: ${logs}`,
-      )
-      assert.ok(
-        !proactiveCheckEntries.some((l) => l.includes('"source":"acct-a"')),
-        "Timer should NOT be checking accounts[0] after switch. " +
-          `Log: ${logs}`,
-      )
+      assert.doesNotMatch(logs, /refresh_(needed|started|failed)/)
     } finally {
       globalThis.setInterval = originalSetInterval
       if (typeof originalHome === "string") {
@@ -1027,70 +1011,90 @@ export function buildAccountLabels(creds) { return creds.map((_, i) => \`Account
     }
   })
 
-  it("proactive refresh timer warns at most once per outage (no spam on repeated failures)", async () => {
-    const originalSetInterval = globalThis.setInterval
+  it("auth fetch uses OpenCode OAuth when Claude credential sources are unavailable", async () => {
     const originalHome = process.env.HOME
-    const originalWarn = console.warn
+    const originalFetch = globalThis.fetch
     const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
     process.env.HOME = tempHome
 
-    let tickCallback: (() => void | Promise<void>) | undefined
-    globalThis.setInterval = ((cb: () => void | Promise<void>) => {
-      tickCallback = cb
-      return { unref() {} }
-    }) as unknown as typeof setInterval
-
-    const warnMessages: string[] = []
-    console.warn = ((...args: unknown[]) => {
-      warnMessages.push(String(args[0]))
-    }) as typeof console.warn
+    let authorization = ""
 
     try {
-      const { helpersModule } = await loadHelpersWithMultiAccountKeychain({
-        // Set acct-a to ALREADY EXPIRED so upstream's tryFallbackAccount
-        // cannot borrow its creds when acct-b's refresh fails. Without
-        // this, the new fallback would return acct-a's still-valid creds
-        // and refreshIfNeeded would return non-null — making the warn
-        // path unreachable and the latch untestable.
-        aExpiresAt: Date.now() - 60_000,
-        // Inside the reactive window, so the refresh chain runs to
-        // exhaustion instead of short-circuiting on still-usable creds.
-        bExpiresAt: Date.now() + 30_000,
-        bRefreshResult: "fail",
-      })
+      const { helpersModule } = await loadHelpersWithEmptyKeychain()
+      globalThis.fetch = (async (_input, init) => {
+        authorization = new Headers(init?.headers).get("authorization") ?? ""
+        return new Response("data: {}\n\n", { status: 200 })
+      }) as typeof fetch
 
       const plugin = await helpersModule.default({} as never)
-      assert.ok(tickCallback)
-
-      const typedPlugin = plugin as {
-        auth?: {
-          methods?: Array<{
-            authorize?: (i: { account?: string }) => Promise<unknown>
-          }>
-        }
-      }
-      await typedPlugin.auth!.methods![0]!.authorize!({ account: "acct-b" })
-
-      warnMessages.length = 0 // ignore any warnings emitted during init/authorize
-
-      // Simulate 3 consecutive failed sync ticks (15 minutes of downtime).
-      // Awaited individually: real ticks are 5 minutes apart, so each one
-      // completes long before the next fires.
-      await tickCallback!()
-      await tickCallback!()
-      await tickCallback!()
-
-      const proactiveWarnings = warnMessages.filter((m) =>
-        m.includes("Proactive token refresh failed"),
+      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
+      const authConfig = await typedPlugin.auth!.loader!(
+        async () => ({
+          type: "oauth",
+          refresh: "opencode-refresh",
+          access: "opencode-access",
+          expires: Date.now() + 10 * 60_000,
+        }),
+        { models: {} },
       )
-      assert.equal(
-        proactiveWarnings.length,
-        1,
-        `Expected exactly 1 warning across 3 failed ticks (latched), got ${proactiveWarnings.length}`,
+
+      const response = await authConfig.fetch(
+        "https://api.anthropic.com/v1/messages",
+        {
+          method: "POST",
+          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
+        },
       )
+
+      assert.equal(response.status, 200)
+      assert.equal(authorization, "Bearer opencode-access")
     } finally {
-      globalThis.setInterval = originalSetInterval
-      console.warn = originalWarn
+      globalThis.fetch = originalFetch
+      if (typeof originalHome === "string") {
+        process.env.HOME = originalHome
+      } else {
+        delete process.env.HOME
+      }
+    }
+  })
+
+  it("auth fetch rejects expired OpenCode OAuth when Claude credential sources are unavailable", async () => {
+    const originalHome = process.env.HOME
+    const originalFetch = globalThis.fetch
+    const tempHome = await mkdtemp(join(tmpdir(), "opencode-claude-auth-home-"))
+    process.env.HOME = tempHome
+
+    let fetchCalls = 0
+
+    try {
+      const { helpersModule } = await loadHelpersWithEmptyKeychain()
+      globalThis.fetch = (async () => {
+        fetchCalls += 1
+        return new Response("data: {}\n\n", { status: 200 })
+      }) as typeof fetch
+
+      const plugin = await helpersModule.default({} as never)
+      const typedPlugin = plugin as { auth?: { loader?: TestAuthLoader } }
+      const authConfig = await typedPlugin.auth!.loader!(
+        async () => ({
+          type: "oauth",
+          refresh: "opencode-refresh",
+          access: "opencode-access",
+          expires: Date.now() - 1,
+        }),
+        { models: {} },
+      )
+
+      await assert.rejects(
+        authConfig.fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          body: JSON.stringify({ model: "claude-haiku-4-5", messages: [] }),
+        }),
+        /credentials are unavailable or expired/,
+      )
+      assert.equal(fetchCalls, 0)
+    } finally {
+      globalThis.fetch = originalFetch
       if (typeof originalHome === "string") {
         process.env.HOME = originalHome
       } else {

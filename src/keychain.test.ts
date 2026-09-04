@@ -23,6 +23,17 @@ import {
   writeBackCredentials,
 } from "./keychain.ts"
 
+function keychainCredentialBlob(accessToken: string): string {
+  return JSON.stringify({
+    claudeAiOauth: {
+      accessToken,
+      refreshToken: `rt-for-${accessToken}`,
+      expiresAt: 1000,
+      subscriptionType: "max",
+    },
+  })
+}
+
 // Mirrors listClaudeKeychainServices regex logic for unit testing
 type MockedKeychain = {
   readAllClaudeAccounts: () => Array<{
@@ -1039,16 +1050,6 @@ describe("writeBackCredentials (keychain source)", () => {
   const SERVICE = "Claude Code-credentials"
   const DUMP = `"${SERVICE}"`
 
-  const blob = (accessToken: string) =>
-    JSON.stringify({
-      claudeAiOauth: {
-        accessToken,
-        refreshToken: `rt-for-${accessToken}`,
-        expiresAt: 1000,
-        subscriptionType: "max",
-      },
-    })
-
   const refreshed = {
     accessToken: "our-refreshed-at",
     refreshToken: "our-refreshed-rt",
@@ -1056,18 +1057,13 @@ describe("writeBackCredentials (keychain source)", () => {
   }
 
   it("skips the write when the stored token is no longer the expected one", async () => {
-    const { writeBackCredentials, __getSecurityWrites } =
+    const { writeBackCredentials: writeBackToMock, __getSecurityWrites } =
       await loadKeychainWithMockedSecurity(DUMP, {
         // Another account was switched in after we read "expected-at".
-        [SERVICE]: blob("switched-in-at"),
+        [SERVICE]: keychainCredentialBlob("switched-in-at"),
       })
 
-    const result = writeBackCredentials(
-      SERVICE,
-      refreshed,
-      undefined,
-      "expected-at",
-    )
+    const result = writeBackToMock(SERVICE, refreshed, undefined, "expected-at")
 
     assert.equal(result, false)
     assert.deepEqual(
@@ -1078,17 +1074,12 @@ describe("writeBackCredentials (keychain source)", () => {
   })
 
   it("writes when the stored token still matches the expected one", async () => {
-    const { writeBackCredentials, __getSecurityWrites } =
+    const { writeBackCredentials: writeBackToMock, __getSecurityWrites } =
       await loadKeychainWithMockedSecurity(DUMP, {
-        [SERVICE]: blob("expected-at"),
+        [SERVICE]: keychainCredentialBlob("expected-at"),
       })
 
-    const result = writeBackCredentials(
-      SERVICE,
-      refreshed,
-      undefined,
-      "expected-at",
-    )
+    const result = writeBackToMock(SERVICE, refreshed, undefined, "expected-at")
 
     assert.equal(result, true)
     const writes = __getSecurityWrites()
@@ -1106,12 +1097,12 @@ describe("writeBackCredentials (keychain source)", () => {
   })
 
   it("writes without a guard when no expected token is supplied", async () => {
-    const { writeBackCredentials, __getSecurityWrites } =
+    const { writeBackCredentials: writeBackToMock, __getSecurityWrites } =
       await loadKeychainWithMockedSecurity(DUMP, {
-        [SERVICE]: blob("whatever-is-there"),
+        [SERVICE]: keychainCredentialBlob("whatever-is-there"),
       })
 
-    assert.equal(writeBackCredentials(SERVICE, refreshed), true)
+    assert.equal(writeBackToMock(SERVICE, refreshed), true)
     assert.equal(__getSecurityWrites().length, 1)
   })
 })
